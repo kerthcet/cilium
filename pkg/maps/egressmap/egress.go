@@ -4,79 +4,72 @@
 package egressmap
 
 import (
+	"errors"
 	"fmt"
 	"net"
-	"unsafe"
 
-	"github.com/cilium/cilium/pkg/bpf"
-	"github.com/cilium/cilium/pkg/types"
+	"github.com/cilium/cilium/pkg/ebpf"
+	"github.com/cilium/cilium/pkg/logging"
+	"github.com/cilium/cilium/pkg/logging/logfields"
+
+	"github.com/sirupsen/logrus"
 )
+
+var log = logging.DefaultLogger.WithField(logfields.LogSubsys, "map-egress")
 
 const (
-	MapName    = "cilium_egress_v4"
-	MaxEntries = 16384
+	PolicyMapName = "cilium_egress_policy_v4"
+
+	MaxPolicyEntries = 1 << 14
 )
 
-// +k8s:deepcopy-gen=true
-// +k8s:deepcopy-gen:interfaces=github.com/cilium/cilium/pkg/bpf.MapKey
-type Key4 struct {
-	// PrefixLen is full 32 bits of SourceIP + DestCIDR's mask bits
-	PrefixLen uint32
+var (
+	EgressPolicyMap *egressPolicyMap
+)
 
-	SourceIP types.IPv4
-	DestCIDR types.IPv4
+// ApplyEgressPolicy adds a new entry to the egress policy map.
+// If a policy with the same key already exists, it will get replaced.
+func ApplyEgressPolicy(sourceIP net.IP, destCIDR net.IPNet, egressIP, gatewayIP net.IP) error {
+	logger := log.WithFields(logrus.Fields{
+		logfields.SourceIP:        sourceIP,
+		logfields.DestinationCIDR: destCIDR,
+		logfields.EgressIP:        egressIP,
+		logfields.GatewayIP:       gatewayIP,
+	})
+
+	if err := EgressPolicyMap.Update(sourceIP, destCIDR, egressIP, gatewayIP); err != nil {
+		return fmt.Errorf("cannot apply egress policy: %w", err)
+	}
+
+	logger.Info("Applied egress policy")
+	return nil
 }
 
-func (k *Key4) GetKeyPtr() unsafe.Pointer { return unsafe.Pointer(k) }
-func (k *Key4) NewValue() bpf.MapValue    { return &EgressInfo4{} }
-func (k *Key4) String() string {
-	return fmt.Sprintf("%s %s/%d", k.SourceIP, k.DestCIDR, k.PrefixLen-getStaticPrefixBits())
+// RemoveEgressPolicy removes an egress policy identified by the (source IP,
+// destination CIDR) tuple.
+func RemoveEgressPolicy(sourceIP net.IP, destCIDR net.IPNet) error {
+	if err := EgressPolicyMap.Delete(sourceIP, destCIDR); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return fmt.Errorf("egress policy does not exist")
+		}
+
+		return err
+	}
+
+	log.WithFields(logrus.Fields{
+		logfields.SourceIP:        sourceIP,
+		logfields.DestinationCIDR: destCIDR,
+	}).Info("Removed egress policy")
+
+	return nil
 }
 
-func getStaticPrefixBits() uint32 {
-	staticMatchSize := unsafe.Sizeof(Key4{})
-	staticMatchSize -= unsafe.Sizeof(Key4{}.PrefixLen)
-	staticMatchSize -= unsafe.Sizeof(Key4{}.DestCIDR)
-	return uint32(staticMatchSize) * 8
+// InitEgressMaps initializes the egress policy map.
+func InitEgressMaps() error {
+	return initEgressPolicyMap(PolicyMapName, true)
 }
 
-// NewKey returns a new Key4 instance
-func NewKey(src, dst net.IP, mask net.IPMask) Key4 {
-	result := Key4{}
-
-	ones, _ := mask.Size()
-
-	copy(result.SourceIP[:], src.To4())
-	copy(result.DestCIDR[:], dst.To4())
-	result.PrefixLen = getStaticPrefixBits() + uint32(ones)
-
-	return result
+// OpenEgressMaps initializes the egress policy map.
+func OpenEgressMaps() error {
+	return initEgressPolicyMap(PolicyMapName, false)
 }
-
-// EgressInfo4 implements the bpf.MapValue interface. It contains the
-// information about egress gateway and egress IP address for masquerading.
-// +k8s:deepcopy-gen=true
-// +k8s:deepcopy-gen:interfaces=github.com/cilium/cilium/pkg/bpf.MapValue
-type EgressInfo4 struct {
-	EgressIP       types.IPv4 `align:"egress_ip"`
-	TunnelEndpoint types.IPv4 `align:"tunnel_endpoint"`
-}
-
-// String pretty print the egress information.
-func (v *EgressInfo4) String() string {
-	return fmt.Sprintf("%s %s", v.TunnelEndpoint, v.EgressIP)
-}
-
-// GetValuePtr returns the unsafe pointer to the BPF value.
-func (v *EgressInfo4) GetValuePtr() unsafe.Pointer { return unsafe.Pointer(v) }
-
-// EgressMap initiates a Map
-var EgressMap = bpf.NewMap(
-	MapName,
-	bpf.MapTypeLPMTrie,
-	&Key4{}, int(unsafe.Sizeof(Key4{})),
-	&EgressInfo4{}, int(unsafe.Sizeof(EgressInfo4{})),
-	MaxEntries,
-	bpf.BPF_F_NO_PREALLOC, 0,
-	bpf.ConvertKeyValue,
-).WithCache()
